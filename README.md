@@ -1,169 +1,92 @@
-Cool — we’ll build this as a **repeatable RCA notebook** with:
+Great question — here’s a **clean, minimal helper** that fits *exactly* into what you showed in `SNMPDevice`, without touching the async scanner or the transport logic.
 
-1. **Traffic normalized to bps** (so spikes are “real bandwidth”)
-2. **Top VIP talker** (ranked during the spike window)
-3. A clean **RCA flow** you can re-run for the next incident
-
-Below is a notebook template you can copy section-by-section.
+This is written so you can literally drop it into `models.py` inside the `SNMPDevice` class.
 
 ---
 
-# RCA Notebook Layout (recommended)
+## 1) Add this helper inside `SNMPDevice`
 
-## Section 0 — Set the incident window (do this first)
+```python
+async def resolve_credentials(self, cred_list):
+    """
+    Try each SNMP credential until one works.
+    Caches the first valid credential on the device.
+    """
+    if getattr(self, "_cred_resolved", False):
+        return self.credentials
 
-In the notebook UI, set the timeframe to:
+    for cred in cred_list:
+        try:
+            ok = await self._test_credential(cred)
+            if ok:
+                self.credentials = cred
+                self._cred_resolved = True
+                return cred
+        except Exception:
+            continue
 
-* **Last 30 days** (to find the spike), then
-* Change to a **tight window** around the spike (ex: 2–6 hours)
-
-You’ll use the tight window for “top talker”.
-
----
-
-# Section 1 — Interface bandwidth (bps) for ports 1.1 and 1.4
-
-### 1A) Bytes IN → **bps**
-
-(keep this line above, then paste the new one right under it)
-
-```dql
-fetch dt.entity.f5_interface
-| filter entity.name == "1.1" or entity.name == "1.4"
-| makeTimeseries value = rate(avg(com.dynatrace.extension.f5.bigip.sys.interface.stat.bytes.in.count)) * 8,
-    resolution: 1m
-```
-
-### 1B) Bytes OUT → **bps**
-
-```dql
-fetch dt.entity.f5_interface
-| filter entity.name == "1.1" or entity.name == "1.4"
-| makeTimeseries value = rate(avg(com.dynatrace.extension.f5.bigip.sys.interface.stat.bytes.out.count)) * 8,
-    resolution: 1m
-```
-
-📌 Why this is correct:
-
-* Your metrics are counters → `rate()` converts to “per second”
-* bytes/sec → `* 8` makes it **bits/sec**
-* 1-minute buckets via `resolution: 1m`
-
----
-
-# Section 2 — Are we dropping/errored during the spike?
-
-### 2A) Errors in/out (rate)
-
-```dql
-fetch dt.entity.f5_interface
-| filter entity.name == "1.1" or entity.name == "1.4"
-| makeTimeseries value = rate(avg(com.dynatrace.extension.f5.bigip.sys.interface.stat.errors.in.count)),
-    resolution: 1m
-```
-
-### 2B) Drops (rate)
-
-```dql
-fetch dt.entity.f5_interface
-| filter entity.name == "1.1" or entity.name == "1.4"
-| makeTimeseries value = rate(avg(com.dynatrace.extension.f5.bigip.sys.interface.stat.drops.in.count)),
-    resolution: 1m
-```
-
-If these stay ~0 while bps spikes → it’s almost always **legit load**, not interface failure.
-
----
-
-# Section 3 — System correlation (connections + droppedPacketRate)
-
-### 3A) Client/server connections
-
-```dql
-timeseries
-  clientConns = avg(com.dynatrace.extension.f5.bigip.sys.clientCurConns),
-  serverConns = avg(com.dynatrace.extension.f5.bigip.sys.serverCurConns),
-  resolution: 1m
-```
-
-### 3B) Dropped packet rate (system)
-
-```dql
-timeseries
-  droppedPacketRate = avg(com.dynatrace.extension.f5.bigip.sys.droppedPacketRate),
-  resolution: 1m
+    raise RuntimeError(f"No valid SNMP credentials for {self.address}")
 ```
 
 ---
 
-# Section 4 — Identify the TOP VIP talker (during the spike window)
+## 2) Add this tiny test method
 
-## 4A) Rank VIPs by **peak requests/min** during the selected timeframe
+This uses a **single lightweight OID** (no walks, no tables):
 
-Set the notebook timeframe to the spike window first.
+```python
+async def _test_credential(self, cred):
+    """
+    Quick SNMP probe to validate a credential.
+    """
+    from pysnmp.hlapi.asyncio import getCmd, ObjectType, ObjectIdentity
 
-```dql
-timeseries vipReqs = avg(com.dynatrace.extension.f5.bigip.virtualserver.stat.tot.requests.count),
-  by: { dt.entity.f5_virtualserver },
-  resolution: 1m
-| fieldsAdd vipName = entityName(dt.entity.f5_virtualserver)
-| fieldsAdd peakReqs = arrayMax(vipReqs)
-| sort peakReqs desc
-| limit 10
-| fields vipName, peakReqs
+    errorIndication, errorStatus, _, varBinds = await getCmd(
+        SnmpEngine(),
+        cred,
+        await self.target,
+        ContextData(),
+        ObjectType(ObjectIdentity("SNMPv2-MIB", "sysName", 0)),
+    )
+
+    if errorIndication or errorStatus:
+        return False
+
+    return True
 ```
 
-This gives you the **top 10 VIPs** by peak request rate in that exact incident window.
+---
 
-> If `entityName()` isn’t recognized in your tenant, replace those two lines with:
+## 3) Wire it in **right above** this line (the one you showed):
 
-```dql
-| fieldsAdd vipName = dt.entity.f5_virtualserver
+```python
+self.credentials = UsmUserData(...)
 ```
 
-You’ll still get the VIP entity IDs (workable for correlation).
+### Replace with:
 
----
+```python
+# line above this already exists in your file
+if not getattr(self, "_cred_resolved", False):
+    await self.resolve_credentials(self.activation.credentials)
 
-## 4B) Plot the top 1–3 VIPs over time (visual confirmation)
-
-Take the top VIP name/ID from 4A, then filter to it:
-
-```dql
-timeseries vipReqs = avg(com.dynatrace.extension.f5.bigip.virtualserver.stat.tot.requests.count),
-  by: { dt.entity.f5_virtualserver },
-  resolution: 1m
-| filter entityName(dt.entity.f5_virtualserver) == "<PASTE_TOP_VIP_NAME_HERE>"
+self.credentials = self.credentials
 ```
 
-If the VIP request spike lines up with interface bps spike → that’s your **top talker RCA**.
+This keeps your existing flow unchanged.
 
 ---
 
-# Section 5 — “Top talker summary” block (ticket-ready)
+## 4) What this gives you
 
-Once you have:
+* One SNMP probe per device
+* Automatic v2/v3 fallback
+* No scanner changes
+* No extra polling
+* No AG burn
 
-* spike timestamp
-* interface bps peak
-* top VIP + peakReqs
-* drops/errors correlation
-
-Use this structure:
-
-* **What happened:** Interface 1.1/1.4 traffic spiked to X bps at TIME
-* **Impact evidence:** drops/errors stayed near 0 (or spiked if they did)
-* **Primary driver:** VIP `<name>` peaked at Y req/min at TIME (aligned)
-* **Supporting evidence:** client/server conns increased to Z at TIME
-* **Conclusion:** spike driven by VIP demand (or by saturation if drops/errors rose)
+Once resolved, every future call uses the working credential.
 
 ---
 
-## Two quick checks to avoid false RCA
-
-* Make sure the notebook timeframe is tight when running 4A (otherwise it ranks “top talkers” over 30 days, not during the incident).
-* If VIP requests don’t correlate but interface bps does, the “top talker” might be **pool member traffic** or **mgmt/replication** traffic — then we pivot to pool/member metrics next.
-
----
-
-If you paste the output of **Section 4A** (top 10 VIPs + peakReqs) and tell me the **spike time**, I’ll give you the exact “Top VIP over time” filter query and a clean RCA paragraph you can drop into a ticket.
+If you paste the surrounding block from `models.py`, I can show you **exactly** where to drop it line-for-line.
